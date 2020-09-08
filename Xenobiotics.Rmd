@@ -1,0 +1,698 @@
+---
+title: "Xenobiotics, July 2020"
+output: html_notebook
+---
+
+This is an [R Markdown](http://rmarkdown.rstudio.com) Notebook. When you execute code within the notebook, the results appear beneath the code. 
+
+Try executing this chunk by clicking the *Run* button within the chunk or by placing your cursor inside it and pressing *Cmd+Shift+Enter*. 
+
+#Setup
+```{r}
+library("phyloseq")
+library("tidyverse")
+library("qiime2R")
+library("ggpubr")
+library("RColorBrewer")
+library("data.table")
+library("ggridges")
+library(vegan)
+```
+
+#Import
+```{r}
+ps <- qza_to_phyloseq("Xeno-table.qza","Xeno-rooted-tree.qza","Xeno-taxonomy.qza")
+my_otu <- otu_table(ps)
+my_tree <- phy_tree(ps)
+my_taxa <- tax_table(ps)
+metadata<-read_tsv("Xeno-metadata.tsv")
+my_meta <- sample_data(metadata)
+sample_names(my_meta) <- metadata$SampleId
+ps2 <- phyloseq(my_otu, my_tree, my_taxa, my_meta)
+ps2
+#check to see that all my sample ids match within my phyloseq object
+v1<-gplots::venn(list(metadata=rownames(my_meta), featuretable=colnames(my_otu)))
+v1
+v2<-gplots::venn(list(metadata=rownames(my_otu), featuretable=rownames(my_taxa)))
+v2
+```
+#Silva Taxonomy adjustment 
+```{r}
+#So qza_to_phyloseq was made to work with the greengenes database and how they annotate. Since I am using silva, the taxonomy wasn't parsed correctly, and the whole string was under Kingdom. This code goes into the kingdom column, and removes everything with D_\\d__ and seperates it by the proper taxa names
+tax <- data.frame(phyloseq::tax_table(ps2)[, 1]) %>%
+  mutate(Kingdom = stringr::str_replace_all(Kingdom, "D_\\d__", ""))
+tax <- tax %>%
+  tidyr::separate(Kingdom, c("Kingdom", "Phylum", "Class", "Order", "Family", "Genus", "Species"), sep = ";")
+
+tax_mat <- as.matrix(tax)
+rownames(tax_mat) <- phyloseq::taxa_names(ps)
+phyloseq::tax_table(ps2) <- tax_mat
+```
+
+#Basic plots on unfiltered data
+```{r}
+p <- plot_bar(ps2, facet_grid = ~Individual, fill = "Phylum", x = "Physiology")
+p + geom_col(aes(width = 3))
+p
+
+#let's make the colour coding consistent first
+phylumGlom <- tax_glom(ps2, "Phylum") #the original phyloseq object, but now glommed by phyla
+getPalette = colorRampPalette(brewer.pal(9, "Spectral"))
+speciesList = unique(tax_table(phylumGlom)[,"Phylum"])
+speciesPalette = getPalette(length(speciesList))
+names(speciesPalette) = speciesList
+
+PhylumGlomBarplot <- plot_bar(phylumGlom, x = "Physiology", fill = "Phylum") +
+  scale_fill_manual(values= speciesPalette) +
+  theme_bw()
+
+
+#Histogram of sequencing depth
+sdt <- data.table(as(sample_data(ps2), "data.frame"),
+                 TotalReads = sample_sums(ps2), keep.rownames = TRUE)
+setnames(sdt, "rn", "SampleID")
+pSeqDepth <- ggplot(sdt, aes(TotalReads, fill = Individual)) + geom_histogram() + ggtitle("Sequencing Depth")
+pSeqDepth
+
+#Let's look at taxa that are present in BONCAT+ and SF to have an idea of the contamination
+SFHpos <- subset_samples(ps2, Physiology == c("SF", "H+"))
+SFHpos <- prune_taxa(taxa_sums(SFHpos) > 0, SFHpos)
+otu_table(SFHpos)
+
+#In just SF samples, there are 75 OTU present
+SF <- subset_samples(ps2, Physiology == "SF")
+SF <- prune_taxa(taxa_sums(SF) > 0, SF)
+#most abundant 645dd8b575c7e7c0952933bbe90b4bb9  Pseudomonas
+#second most abundant 94ef08db649a5339b6de95109a8bad0f Pseudomonas stutzeri
+# third "eb41af02b18dc957ef593cfd11261be5" Pseudomonodales Moraxellaceae 
+# fourth "397baa08e9a7370e89e0c70ea147b098" Propionibacteirum Cutibacterium at 734 reads in all SF samples
+# fifth "92fb114641e27921122496428e2ef0dd"  Propionibacteirum Cutibacterium
+# 6th is 1cd30fcbf9157649a8933f4b41240f95 fusobacterium
+# 7th is Streptococcusat 264 reads total
+tax_table(ps2)["80a5f5f21a016ee4a67334d2c3003764"]
+names(sort(taxa_sums(SF), TRUE)[1:10])
+taxa_sums(SF)["80a5f5f21a016ee4a67334d2c3003764"]
+```
+#Filtering
+```{r}
+#I want to filter out what's contamination. The goal with that is remove whatever ASVs are present in the SF, but completely absent from the DNA, and remove that ASV
+
+#If >0 in SF, but ==0 in DNA, remove!
+
+#return taxa names that are present in sheath fluid
+SF <- subset_samples(ps2, Physiology == "SF")
+#only keep taxa that are present >0
+SF <- prune_taxa(taxa_sums(SF) > 0, SF) 
+SFnames <- taxa_names(SF) #taxa that are present in sheath fluid, 75 taxa present in the sheath fluid
+DNAps2 <- subset_samples(ps2, Physiology == "WC")
+DNAps2 <- prune_taxa(taxa_sums(DNAps2) < 1, DNAps2) 
+otu_table(DNAps2)
+DNAps2names <- taxa_names(DNAps2) 
+#Now I want to find the intersection between SFnames and DNAps2names (ie found in SF, but absent from DNA, as in the name DNAps2names)
+Taxa_to_filter <- intersect(SFnames, DNAps2names)
+#there are 69 taxa that are present in sheath fluid but absent from DNA 
+Taxa_to_keep <- setdiff(taxa_names(ps2), Taxa_to_filter)
+length(Taxa_to_keep)
+ps2_NoSF <- prune_taxa(Taxa_to_keep, ps2)
+ps2_NoSF
+
+#Went from 2536 taxa to 2480 taxa, that's a decrease of 56 taxa
+
+#Let's identiy the taxa we removed
+Taxa_filtered <- prune_taxa(Taxa_to_filter, ps2)
+tax_table(Taxa_filtered)
+
+#How abundant are the filtered taxa in my other samples
+ps2NC <- subset_samples(ps2, Physiology != "SF")
+ps2NC.FilteredTaxa <- prune_taxa(Taxa_to_filter, ps2)
+taxa_sums(ps2NC.FilteredTaxa)
+taxa_sums(ps2)
+
+#barplot of unfiltered but sf contam removed
+
+ps2_NoSF_GlomP <- tax_glom(ps2_NoSF, "Phylum")
+ps2_NoSF_mergeGlomP <- merge_samples(ps2_NoSF, "Physiology")
+ps2_NoSF_GlomPplot <- plot_bar(ps2_NoSF_GlomP, x = "Physiology", fill = "Phylum") +
+  scale_fill_manual(values= speciesPalette) +
+  theme_bw()
+ps2_NoSF_GlomPplot
+#barplot of unfiltered for comparisons
+ps2_GlomP <- tax_glom(ps2, "Phylum")
+ps2_mergeGlomP <- merge_samples(ps2, "Physiology")
+ps2_GlomPplot <- plot_bar(ps2_GlomP, x = "Physiology", fill = "Phylum") +
+  scale_fill_manual(values= speciesPalette) +
+  theme_bw()
+ps2_GlomPplot
+```
+
+#More filtering
+```{r}
+#Based off the workflow in: Bioconductor Workflow for Microbiome Data Analysis: from raw reads to community analyses [version 2; peer review: approved]
+
+#Remove those where taxa is unassigned past bacteria (no phyla designation)
+table(tax_table(ps2_NoSF)[, "Phylum"], exclude = NULL)
+table(tax_table(ps2)[, "Phylum"], exclude = NULL)
+# Create table, number of features for each phyla
+ps0 <- subset_taxa(ps2_NoSF, !is.na(Phylum) & !Phylum %in% c("", "uncharacterized"))
+# Compute prevalence of each feature, store as data.frame
+prevdf = apply(X = otu_table(ps0),
+ MARGIN = ifelse(taxa_are_rows(ps0), yes = 1, no = 2),
+ FUN = function(x){sum(x > 0)})
+# Add taxonomy and total read counts to this data.frame
+prevdf = data.frame(Prevalence = prevdf,
+ TotalAbundance = taxa_sums(ps0),
+ tax_table(ps0))
+plyr::ddply(prevdf, "Phylum", function(df1){cbind(mean(df1$Prevalence),sum(df1$Prevalence))})
+#list of phyla to remove
+PhylatoFiler = c("Acidobacteria","Ambiguous_taxa", "Chloroflexi", "Deinococcus-Thermus", "FBP", "Gemmatimonadetes", "Cyanobacteria", "Spirochaetes", "Synergistetes", "WPS-2")
+ps3 <- subset_taxa(ps0, !Phylum %in% PhylatoFiler)
+ps3 #went from 2464 taxa to 2407
+
+#Distrubtion of read counts
+tdt3 = data.table(tax_table(ps3),
+                 TotalCounts = taxa_sums(ps3),
+                 OTU = taxa_names(ps3))
+ggplot(tdt3, aes(TotalCounts)) + 
+  geom_histogram(bins=100) + 
+  ggtitle("Histogram of Total Counts") +
+  xlim(0,100)
+
+# How many singletons?
+tdt3[(TotalCounts <= 0), .N] #0
+# How many doubletons?
+tdt3[(TotalCounts <= 2), .N] #295
+#How many 5ers
+tdt3[(TotalCounts <= 5), .N] #562
+
+# taxa cumulative sum
+taxcumsum3 = tdt3[, .N, by = TotalCounts]
+setkey(taxcumsum3, TotalCounts)
+taxcumsum3[, CumSum := cumsum(N)]
+# Define the plot
+pCumSum3 = ggplot(taxcumsum3, aes(TotalCounts, CumSum)) + 
+  geom_point() +
+  xlab("Filtering Threshold, Minimum Total Counts") +
+  ylab("OTUs Filtered") +
+  ggtitle("OTUs that would be filtered vs. the minimum count threshold")
+pCumSum3
+
+#zoom in
+pCumSum3 + xlim(0, 50)
+
+source("~/taxa_summary.R")
+
+mdt3 = fast_melt(ps3)
+prevdt3 = mdt3[, list(Prevalence = sum(count > 0), 
+                    TotalCounts = sum(count)),
+             by = taxaID]
+
+# Source the file that defines the new functions
+source("~/taxa_summary.R", local = TRUE)
+ggplot(prevdt3, aes(Prevalence)) + 
+  geom_histogram(bins=50) + 
+  ggtitle("Histogram of Taxa Prevalence")
+
+
+#Plot total counts vs prevalence 
+ggplot(prevdt3, aes(Prevalence, TotalCounts)) + 
+  geom_point(size = 4, alpha = 0.75) + 
+  scale_y_log10()
+#same scatter plot but now coloured by taxa
+addPhylum3 = unique(copy(mdt3[, list(taxaID,Phylum)]))
+# Join by TaxaID
+setkey(prevdt3, taxaID)
+setkey(addPhylum3, taxaID)
+prevdt3 <- addPhylum3[prevdt3]
+showPhyla3 = prevdt3[, sum(TotalCounts), by = Phylum][order(-V1)][1:9]$Phylum
+setkey(prevdt3, Phylum)
+
+ggplot(prevdt3[showPhyla3], 
+       mapping = aes(Prevalence, TotalCounts, colour = Phylum)) + 
+  geom_point(size = 3) + 
+  scale_colour_brewer(palette = "Paired") +
+  scale_y_log10() +
+  xlim(0,20) + #zooming in to see what phyla are responsable for less prevalent taxa
+  ylim(0,1000)
+
+#Based on all this, the least stringent, but necessary filtering I will do is it ha to be present in at least 2 samples, with a count of at least 5. (maybe I should move it up to 3 samples)
+ps4 <- filter_taxa(ps3, function(x) sum(x > 4) > (0.02*length(x)), TRUE) #514 taxa
+ps4Glom <- tax_glom(ps4, "Phylum")
+ps4_GlomPplot <- plot_bar(ps4Glom, x = "Physiology", fill = "Phylum") +
+  scale_fill_manual(values= speciesPalette) +
+  theme_bw() #saved as ps4
+
+#filter out the controls
+Controls = c("SF", "Positive", "Negative")
+ps4NC <- subset_samples(ps4, !Physiology %in% Controls) #123 samples, 514 taxa
+```
+#Basic barplots of filtered data
+```{r}
+#summarize_taxa(ps4, Rank = "Phylum")
+#plot_taxa_summary(ps4, "Phylum")
+ps4NC %>% 
+  psmelt() %>% 
+  group_by(Sample) %>% 
+  mutate(Proportion = Abundance / sum(Abundance, na.rm = TRUE)) %>% 
+  filter(Proportion > 0) %>% 
+  filter(!is.na(Class)) %>% 
+  ggplot(aes(y = Class, x = log10(Proportion), fill = Class)) +
+  ggridges::geom_density_ridges2(scale = 1, alpha = 0.7, show.legend = FALSE) +
+  ggtitle("Compare distribution of relative abundances")
+
+#Basic barplot
+ps4NCRAPhys <- merge_samples(ps4NC, "Physiology") #now row titles are physiology
+ps4NCRAPhysRA <- transform_sample_counts(ps4NCRAPhys, function(x) x / sum(x) )
+ps4NCRAPhysRAGlom <- tax_glom(ps4NCRAPhysRA, "Phylum")
+plot_bar(ps4NCRAPhysRAGlom, fill = "Phylum") +
+  scale_fill_manual(values= speciesPalette) +
+  theme_bw() +
+  theme(text = element_text(size = 16)) 
+
+#What are the Proteobacteria in BONCAT
+Hpos <- subset_samples(ps4, Physiology == "BCpos")
+HposProteo <- subset_taxa(Hpos, Phylum == "Proteobacteria")
+taxa_sums(HposProteo)
+otu_table(ps4NC)["645dd8b575c7e7c0952933bbe90b4bb9"]
+tax_table(ps4NC)["645dd8b575c7e7c0952933bbe90b4bb9"]
+#B never once has this ASV in their whole community, but it shows up in sorted. A has it show up in 3 WC samples, and never in a repeatable way.
+
+otu_table(ps4NC)["eb41af02b18dc957ef593cfd11261be5"]
+tax_table(ps4NC)["eb41af02b18dc957ef593cfd11261be5"]
+
+otu_table(ps4NC)["94ef08db649a5339b6de95109a8bad0f"]
+tax_table(ps4NC)["94ef08db649a5339b6de95109a8bad0f"]
+otu_table(ps4NC)["ac164649e33237f799c1ffee4f344d5d"] #This is e coli shigella, and is found in low abundance in all A WC and in high abundance in A sorted. it's absent from B WC and mostly from sorted too, so this difference between individuals makes me thing it's a real ASV
+tax_table(ps4NC)["ac164649e33237f799c1ffee4f344d5d"]
+
+otu_table(ps4NC)["29b313a5262947210e3e9de415abaead"] #basically in just one sample
+tax_table(ps4NC)["29b313a5262947210e3e9de415abaead"]
+otu_table(ps4NC)["e7a976062285e7c9e4f54891a408832f"] 
+tax_table(ps4NC)["e7a976062285e7c9e4f54891a408832f"] #basically in just one sample
+
+otu_table(ps4NC)["c0576cda75a963b4255da5f7ec9c51fd"] #basically in just one sample
+tax_table(ps4NC)["c0576cda75a963b4255da5f7ec9c51fd"]
+
+otu_table(ps4NC)["41f01f3e3cbf6beb908ae1ebb553208e"] #basically in just one sample
+tax_table(ps4NC)["41f01f3e3cbf6beb908ae1ebb553208e"]
+
+#get a list of names that are present in less than three samples, remove them
+filter_taxa(HposProteo, function(x) sum(x > 10) > (0.1*length(x))) 
+
+To.remove <- c("645dd8b575c7e7c0952933bbe90b4bb9", "eb41af02b18dc957ef593cfd11261be5", "94ef08db649a5339b6de95109a8bad0f", "29b313a5262947210e3e9de415abaead" , "e7a976062285e7c9e4f54891a408832f", "923f46a8c4f709ed42944e9a320936da", "c0576cda75a963b4255da5f7ec9c51fd", "41f01f3e3cbf6beb908ae1ebb553208e", "509f1f09b18a33b87b49b2e80cc8bdfe", "41f01f3e3cbf6beb908ae1ebb553208e", "89812f0c41359a0ffbf59f4708fc447e", "84143a32a142a2e05f3584b3efc8a96f", "c331094ff01669229c8ec91820f9b536", "8420e612ce681b013ae1abebe20a8f78", "25be8565bb6d4b0ebcfc117225491be2", "6985cade0eb836e21f149f8dbf0b2bc6", "16e2e2408cedf8f9faae33004fb5eaa2" , "79f37fee0660e917bd1debe546718bad", "dd4ac7657b2665699cffd5a9b939a260", "55059a9497be05fc884a4c6b7fd02a1c", "ff6f97ce50ea01298f8e58b53b97d489", "7a2aee24054fc5614d127025c3903048" , "f42aeaf1c13130f1fdfc8bafa43ded29"," 639649d4fc0658762d1a8affaac261fd", "efde527a9af4cac96884dbd692f6e11c" , "fc8f29ee92de1143865f74f59b66d62b",  "de37924a899deb0663ed26f8e21d0a3f", "250a576e3788b3f444938c7b08afb2e3" , "b04d79aff7bd4690f50e98347f54fba0", "b8249c91f8e29b2f4fb65d0c2c46bf1d", "7dba3a44c02a95365d564c7bc3d13fe4" , "9b6a7459b2c92cee0abfc36d503488b7", "4c834fe74f0b0eff00aac767803bba7a", "5f0cbc930515c7ec606289b79d8c4ba3", "0628daa998fa475f39165d5f1bf2d27e", "639649d4fc0658762d1a8affaac261fd", "efb6ca57b3186248dafe3c3c6ce6524b", "4c3685c132f5b6790e4eabef3274a2f7", "92fb114641e27921122496428e2ef0dd" )
+
+pseudomonas <- prune_taxa(To.remove, ps4)
+ps5names <- setdiff(taxa_names(ps4), taxa_names(pseudomonas))
+ps5 <- prune_taxa(ps5names, ps4) #482 taxa
+ps5NC <- subset_samples(ps5, !Physiology %in% Controls)
+
+#Rechecking the basic barplots
+#summarize_taxa(ps5, Rank = "Phylum")
+#plot_taxa_summary(ps5, "Phylum")
+ps5NC %>% 
+  psmelt() %>% 
+  group_by(Sample) %>% 
+  mutate(Proportion = Abundance / sum(Abundance, na.rm = TRUE)) %>% 
+  filter(Proportion > 0) %>% 
+  filter(!is.na(Class)) %>% 
+  ggplot(aes(y = Class, x = log10(Proportion), fill = Class)) +
+  ggridges::geom_density_ridges2(scale = 1, alpha = 0.7, show.legend = FALSE) +
+  ggtitle("Compare distribution of relative abundances")
+
+#Basic barplot
+ps5NCRAPhys <- merge_samples(ps5NC, "Indiv.Tx.Phys") #now row titles are physiology
+ps5NCRAPhysRA <- transform_sample_counts(ps5NCRAPhys, function(x) x / sum(x) )
+ps5NCRAPhysRAGlom <- tax_glom(ps5NCRAPhysRA, "Phylum")
+plot_bar(ps5NCRAPhysRAGlom, fill = "Phylum", facet_grid = ~Physiology) +
+  scale_fill_manual(values= speciesPalette) +
+  theme_bw() +
+  theme(text = element_text(size = 16)) 
+
+B <- subset_samples(ps5, Individual == "B")
+B <- subset_samples(B, Physiology != "SF")
+A <- subset_samples(ps5, Individual == "A")
+A <- subset_samples(A, Physiology != "SF")
+
+#Make a graph of each physiological group
+graph <- function(ps, level, title) {
+  z <- merge_samples(ps, "Treatment") #merge by treatment
+  y <- transform_sample_counts(z, function(x) x / sum(x) ) #relative abundance
+  yglom <- tax_glom(y, level) #taxonomic level 
+  p <- plot_bar(yglom, fill = level, title = title) +
+    scale_fill_manual(values= speciesPalette) +
+   theme_bw() +
+    theme(text = element_text(size = 16))
+  print(p)
+  }
+
+HNA <- subset_samples(B, Physiology == "HNA")
+LNA <-subset_samples(B, Physiology == "LNA")
+PI <-subset_samples(B, Physiology == "PI")
+BONCAT <-subset_samples(B, Physiology == "BCpos")
+WC <-subset_samples(B, Physiology == "WC")
+graph(HNA, "Phylum", "HNA")
+ggsave("BHNA.pdf")
+graph(LNA, "Phylum", "LNA")
+ggsave("BLNA.pdf")
+graph(PI, "Phylum", "PI")
+ggsave("BPI.pdf")
+graph(BONCAT, "Phylum", "BONCAT+")
+ggsave("BBONCAT.pdf")
+graph(WC, "Phylum", "WC")
+ggsave("BWC.pdf")
+
+FamGlom <- tax_glom(ps5, "Family") #the original phyloseq object, but now glommed by phyla
+getPalette2 = colorRampPalette(brewer.pal(9, "Set1"))
+speciesList2 = unique(tax_table(FamGlom)[,"Family"])
+speciesPalette2 = getPalette(length(speciesList2))
+names(speciesPalette2) = speciesList2
+
+Top10 <- function(ps, title) {
+  ps5NCFam <- tax_glom(ps, "Family")
+  Top10Fam <- names(sort(taxa_sums(ps5NCFam), TRUE)[1:10])
+  Top10Famps5 <- prune_species(Top10Fam, ps5NCFam)
+#Take what is not in top 10 and name as other
+  AllFam <- taxa_names(ps5NCFam)
+  OtherFam <- setdiff(AllFam, Top10Fam) #"c8d2b3167ef685d221379c95b2553a66"
+  z <- merge_taxa(ps5NCFam, OtherFam, 1)
+  y <- transform_sample_counts(z, function(x) x / sum(x) )
+  ps5NC_TopFam2 <- tax_glom(y, "Family")
+
+  p <- plot_bar(ps5NC_TopFam2, x = "Treatment", fill = "Family", title = title) +
+  scale_fill_manual(values= speciesPalette2) +
+   theme_bw() +
+    theme(text = element_text(size = 16))
+  print(p)
+}
+
+Top10(HNA, "HNA")
+ggsave("HNAFamB.pdf")
+Top10(WC, "WC")
+ggsave("WCFamB.pdf")
+Top10(LNA, "LNA")
+ggsave("LNAFamB.pdf")
+Top10(PI, "PI")
+ggsave("PIFamB.pdf")
+Top10(BONCAT, "BONCAT+")
+ggsave("BONCATFamB.pdf")
+
+#A
+HNA <- subset_samples(A, Physiology == "HNA")
+LNA <-subset_samples(A, Physiology == "LNA")
+PI <-subset_samples(A, Physiology == "PI")
+BONCAT <-subset_samples(A, Physiology == "BCpos")
+WC <-subset_samples(A, Physiology == "WC")
+graph(HNA, "Phylum", "HNA")
+ggsave("AHNA.pdf")
+graph(LNA, "Phylum", "LNA")
+ggsave("ALNA.pdf")
+graph(PI, "Phylum", "PI")
+ggsave("API.pdf")
+graph(BONCAT, "Phylum", "BONCAT+")
+ggsave("ABONCAT.pdf")
+graph(WC, "Phylum", "WC")
+ggsave("AWC.pdf")
+
+Top10(HNA, "HNA")
+ggsave("HNAFamA.pdf")
+Top10(WC, "WC")
+ggsave("WCFamA.pdf")
+Top10(LNA, "LNA")
+ggsave("LNAFamA.pdf")
+Top10(PI, "PI")
+ggsave("PIFamA.pdf")
+Top10(BONCAT, "BONCAT+")
+ggsave("BONCATFamA.pdf")
+```
+#DESeq2 transformation
+```{r}
+library("DESeq2")
+B <- subset_samples(ps5, Individual == "B")
+B <- subset_samples(B, Physiology != "SF")
+#remove VLNA for figures
+B <- subset_samples(B, Physiology != "VLNA")
+
+A <- subset_samples(ps5, Individual == "A")
+A <- subset_samples(A, Physiology != "SF")
+
+B.DS = phyloseq_to_deseq2(B,  ~ Indiv.Tx.Phys)
+A.DS = phyloseq_to_deseq2(A,  ~ Indiv.Tx.Phys)
+
+#add pseucount
+B.DS.pseudo <- B.DS@assays@data$counts + 1
+A.DS.pseudo <- A.DS@assays@data$counts + 1
+
+#vst transformation
+B.dds.vst <- varianceStabilizingTransformation(B.DS.pseudo)
+B.dds.rlog <- rlog(B.DS.pseudo)
+A.dds.vst <- varianceStabilizingTransformation(A.DS.pseudo)
+A.dds.rlog <- rlog(A.DS.pseudo)
+
+# making our phyloseq object with transformed table, adding back in the original tree and taxonomy
+#B
+B.vst_count_phy <- otu_table(B.dds.vst, taxa_are_rows=T)
+B.sample_info_tab_phy <- sample_data(B)
+B.vst_physeq <- phyloseq(B.vst_count_phy, B.sample_info_tab_phy, tax_table(B), phy_tree(B))
+
+B.rlog_count_phy <- otu_table(B.dds.rlog, taxa_are_rows=T)
+taxa_names(B.rlog_count_phy) <- taxa_names(B.vst_count_phy)
+B.rlog_physeq <- phyloseq(B.rlog_count_phy, B.sample_info_tab_phy, tax_table(B), phy_tree(B))
+
+#A
+A.vst_count_phy <- otu_table(A.dds.vst, taxa_are_rows=T)
+A.sample_info_tab_phy <- sample_data(A)
+A.vst_physeq <- phyloseq(A.vst_count_phy, A.sample_info_tab_phy, tax_table(A), phy_tree(A))
+
+A.rlog_count_phy <- otu_table(A.dds.rlog, taxa_are_rows=T)
+taxa_names(A.rlog_count_phy) <- taxa_names(A.vst_count_phy)
+A.rlog_physeq <- phyloseq(A.rlog_count_phy, A.sample_info_tab_phy, tax_table(A), phy_tree(A))
+```
+#PCoA of transformed data B
+```{r}
+counts = otu_table(B.rlog_physeq)
+tree = phy_tree(B.rlog_physeq)
+B.rbiom_weighted.rlog = rbiom::unifrac(counts, weighted=TRUE, tree=tree)
+
+#making the Paired palette excluding the BONCAT- colour
+palette = c("#1F78B4", "#B2DF8A", "#33A02C", "#FB9A99", "#E31A1C")
+
+## Rlog WU
+B.pcoa.rlog = ordinate(B.rlog_physeq, method="PCoA", distance=B.rbiom_weighted.rlog)
+# Physiology 
+plot_ordination(B.rlog_physeq, B.pcoa.rlog, "samples", color="Physiology", shape = "Treatment", title = "B WUnifrac PCoA, rlog") + 
+  geom_point(size=3) + theme_bw() +  theme(text = element_text(size = 16)) + scale_color_manual(values=palette)
+
+#based on this PCoA, I should remove samples B G2 H+ and B N3H+
+
+metadata <- as(sample_data(B.rlog_physeq), "data.frame")
+
+adonis(B.rbiom_weighted.rlog ~ Physiology*Treatment, # R2 = 0.7795 p = 0.001
+       data = as(sample_data(B.rlog_physeq), "data.frame"))
+
+adonis(B.rbiom_weighted.rlog ~ Treatment%in%Physiology, # R2 = 0.7795 p = 0.001
+       data = as(sample_data(B.rlog_physeq), "data.frame"))
+
+betadisp <- betadisper(B.rbiom_weighted.rlog, metadata$Treatment)
+permutest(betadisp)
+```
+#PCoA of transformed data A
+```{r}
+counts = otu_table(A.rlog_physeq)
+tree = phy_tree(A.rlog_physeq)
+A.rbiom_weighted.rlog = rbiom::unifrac(counts, weighted=TRUE, tree=tree)
+
+## Rlog WU
+A.pcoa.rlog = ordinate(A.rlog_physeq, method="PCoA", distance=A.rbiom_weighted.rlog)
+# Physiology 
+plot_ordination(A.rlog_physeq, A.pcoa.rlog, "samples", color="Physiology", shape = "Treatment", title = "A WUnifrac PCoA, rlog") + 
+  geom_point(size=3) + theme_bw() +  theme(text = element_text(size = 16)) + scale_color_manual(values=palette)
+
+#based on this PCoA, I should remove samples A G2 H+ and A N3H+
+
+metadata <- as(sample_data(A.rlog_physeq), "data.frame")
+
+adonis(A.rbiom_weighted.rlog ~ Physiology*Treatment, 
+       data = as(sample_data(A.rlog_physeq), "data.frame"))
+
+adonis(A.rbiom_weighted.rlog ~ Treatment %in% Physiology, 
+       data = as(sample_data(A.rlog_physeq), "data.frame"))
+
+betadisp <- betadisper(A.rbiom_weighted.rlog, metadata$Physiology)
+permutest(betadisp)
+
+#Pairwise
+library(pairwiseAdonis)
+A.Phys.pw <- pairwise.adonis(A.rbiom_weighted.rlog, sample_data(A.rlog_physeq)$Indiv.Tx.Phys, p.adjust.m = "fdr", perm = 5500, reduce = "WC")
+A.Phys.pw
+
+#Specific questions
+#Does any subpopulation change based on treatment?
+WUPairwise <- function(ps, group) {
+  s <- phyloseq::subset_samples(ps, Physiology == group)
+  counts = otu_table(s)
+  tree = phy_tree(s)
+  WU = rbiom::unifrac(counts, weighted=TRUE, tree=tree)
+  x = pairwise.adonis(WU, sample_data(s)$Treatment, p.adjust.m = "fdr")
+  return(x)
+  }
+
+WUPairwise(A.rlog_physeq, "WC")
+WUPairwise(A.rlog_physeq, "HNA")
+WUPairwise(A.rlog_physeq, "LNA")
+WUPairwise(A.rlog_physeq, "PI")
+WUPairwise(A.rlog_physeq, "H+")
+
+#Is WC of any of the xenobiotics different than the whole community?
+A.WC.rlog <- subset_samples(A.rlog_physeq, Physiology == "WC")
+counts = otu_table(A.WC.rlog)
+tree = phy_tree(A.WC.rlog)
+A.rbiom_weighted.rlog.WC = rbiom::unifrac(counts, weighted=TRUE, tree=tree)
+pairwise.adonis(A.rbiom_weighted.rlog.WC, sample_data(A.WC.rlog)$Treatment, p.adjust.m = "fdr")
+#Adding the xenobiotics, even glucose, does not change the whole community
+
+#Does HNA change?
+A.HNA.rlog <- subset_samples(A.rlog_physeq, Physiology == "HNA")
+counts = otu_table(A.HNA.rlog)
+tree = phy_tree(A.HNA.rlog)
+A.rbiom_weighted.rlog.HNA = rbiom::unifrac(counts, weighted=TRUE, tree=tree)
+pairwise.adonis(A.rbiom_weighted.rlog.HNA, sample_data(A.HNA.rlog)$Treatment, p.adjust.m = "fdr")
+# No
+
+#Does LNA change?
+A.LNA.rlog <- subset_samples(A.rlog_physeq, Physiology == "LNA")
+counts = otu_table(A.LNA.rlog)
+tree = phy_tree(A.LNA.rlog)
+A.rbiom_weighted.rlog.LNA = rbiom::unifrac(counts, weighted=TRUE, tree=tree)
+pairwise.adonis(A.rbiom_weighted.rlog.LNA, sample_data(A.LNA.rlog)$Treatment, p.adjust.m = "fdr", perm = 99999)
+#Nizatidine has a p of 0.1, can't seem to get it lower with more permuations. 
+
+#Does PI change?
+A.PI.rlog <- subset_samples(A.rlog_physeq, Physiology == "PI")
+counts = otu_table(A.PI.rlog)
+tree = phy_tree(A.PI.rlog)
+A.rbiom_weighted.rlog.PI = rbiom::unifrac(counts, weighted=TRUE, tree=tree)
+pairwise.adonis(A.rbiom_weighted.rlog.PI, sample_data(A.PI.rlog)$Treatment, p.adjust.m = "fdr", perm = 9999)
+# No
+
+#Does H+ change?
+A.H.rlog <- subset_samples(A.rlog_physeq, Physiology == "BCpos")
+counts = otu_table(A.H.rlog)
+tree = phy_tree(A.H.rlog)
+A.rbiom_weighted.rlog.H = rbiom::unifrac(counts, weighted=TRUE, tree=tree)
+pairwise.adonis(A.rbiom_weighted.rlog.H, sample_data(A.H.rlog)$Treatment, p.adjust.m = "fdr", perm = 9999)
+#No
+```
+
+#What about Bray
+```{r}
+#Hpos
+distance = (phyloseq::distance(A.H.rlog, method="bray"))
+pairwise.adonis(distance, sample_data(A.H.rlog)$Treatment, p.adjust.m = "fdr", perm = 9999)
+
+#HNA
+distance = (phyloseq::distance(A.HNA.rlog, method="bray"))
+pairwise.adonis(distance, sample_data(A.HNA.rlog)$Treatment, p.adjust.m = "fdr", perm = 9999)
+
+#LNA
+distance = (phyloseq::distance(A.LNA.rlog, method="bray"))
+pairwise.adonis(distance, sample_data(A.LNA.rlog)$Treatment, p.adjust.m = "fdr", perm = 9999)
+
+#PI
+distance = (phyloseq::distance(A.PI.rlog, method="bray"))
+pairwise.adonis(distance, sample_data(A.PI.rlog)$Treatment, p.adjust.m = "fdr", perm = 9999)
+
+#WC
+distance = (phyloseq::distance(A.WC.rlog, method="bray"))
+pairwise.adonis(distance, sample_data(A.WC.rlog)$Treatment, p.adjust.m = "fdr", perm = 9999)
+
+#Also all ns different from control 
+
+#B
+#Does HNA change?
+B.HNA.rlog <- subset_samples(B.rlog_physeq, Physiology == "HNA")
+counts = otu_table(B.HNA.rlog)
+tree = phy_tree(B.HNA.rlog)
+B.rbiom_weighted.rlog.HNA = rbiom::unifrac(counts, weighted=TRUE, tree=tree)
+pairwise.adonis(B.rbiom_weighted.rlog.HNA, sample_data(B.HNA.rlog)$Treatment, p.adjust.m = "fdr")
+# No
+
+#Does LNA change? #C vs G is 0.1
+B.LNA.rlog <- subset_samples(B.rlog_physeq, Physiology == "LNA")
+counts = otu_table(B.LNA.rlog)
+tree = phy_tree(B.LNA.rlog)
+B.rbiom_weighted.rlog.LNA = rbiom::unifrac(counts, weighted=TRUE, tree=tree)
+pairwise.adonis(B.rbiom_weighted.rlog.LNA, sample_data(B.LNA.rlog)$Treatment, p.adjust.m = "fdr", perm = 99999)
+#Glucose has a p of 0.1, can't seem to get it lower with more permuations. 
+
+#Does PI change?
+B.PI.rlog <- subset_samples(B.rlog_physeq, Physiology == "PI")
+counts = otu_table(B.PI.rlog)
+tree = phy_tree(B.PI.rlog)
+B.rbiom_weighted.rlog.PI = rbiom::unifrac(counts, weighted=TRUE, tree=tree)
+pairwise.adonis(B.rbiom_weighted.rlog.PI, sample_data(B.PI.rlog)$Treatment, p.adjust.m = "fdr", perm = 9999)
+# Digoxin is 0.1
+
+#Does H+ change?
+B.H.rlog <- subset_samples(B.rlog_physeq, Physiology == "BCpos")
+counts = otu_table(B.H.rlog)
+tree = phy_tree(B.H.rlog)
+B.rbiom_weighted.rlog.H = rbiom::unifrac(counts, weighted=TRUE, tree=tree)
+pairwise.adonis(B.rbiom_weighted.rlog.H, sample_data(B.H.rlog)$Treatment, p.adjust.m = "fdr", perm = 9999)
+#No
+
+#Does WC change?
+B.WC.rlog <- subset_samples(B.rlog_physeq, Physiology == "WC")
+counts = otu_table(B.WC.rlog)
+tree = phy_tree(B.WC.rlog)
+B.rbiom_weighted.rlog.WC = rbiom::unifrac(counts, weighted=TRUE, tree=tree)
+pairwise.adonis(B.rbiom_weighted.rlog.WC, sample_data(B.WC.rlog)$Treatment, p.adjust.m = "fdr", perm = 9999)
+#GLucose 0.1
+
+#Bray
+#Hpos
+distance = (phyloseq::distance(B.H.rlog, method="bray"))
+pairwise.adonis(distance, sample_data(B.H.rlog)$Treatment, p.adjust.m = "fdr", perm = 9999)
+
+#HNA
+distance = (phyloseq::distance(B.HNA.rlog, method="bray"))
+pairwise.adonis(distance, sample_data(B.HNA.rlog)$Treatment, p.adjust.m = "fdr", perm = 9999)
+
+#LNA
+distance = (phyloseq::distance(B.LNA.rlog, method="bray"))
+pairwise.adonis(distance, sample_data(B.LNA.rlog)$Treatment, p.adjust.m = "fdr", perm = 9999)
+#Glucose is 0.1
+
+#PI
+distance = (phyloseq::distance(B.PI.rlog, method="bray"))
+pairwise.adonis(distance, sample_data(B.PI.rlog)$Treatment, p.adjust.m = "fdr", perm = 9999)
+#Digoxin is 0.1
+
+#WC
+distance = (phyloseq::distance(B.WC.rlog, method="bray"))
+pairwise.adonis(distance, sample_data(B.WC.rlog)$Treatment, p.adjust.m = "fdr", perm = 9999)
+
+```
+#PCoA by physiology
+```{r}
+#Axis.1 under $vectors and cbind by row title (sampleid) to metadata dataframe
+wu.rlog <- as.data.frame(A.pcoa.rlog$vectors)
+wu.rlog <- rownames_to_column(wu.rlog, var = "SampleId")
+metadata <- as(sample_data(A.rlog_physeq), "data.frame")
+wu.rlog = left_join(wu.rlog, metadata, by = "SampleId")
+
+ggplot(wu.rlog, aes(Physiology, Axis.1)) + 
+  geom_point(aes(colour = Treatment), size = 4) +
+  xlab("Physiology") +
+  ylab("PCoA1") +
+  ggtitle("WUPCoA1 by Physiology on rlog transformed data") +
+  theme_bw() +
+  theme(text = element_text(size = 16)) 
+ggsave("WUPCoA1rlog.pdf")
+
+ggplot(wu.rlog, aes(Physiology, Axis.3)) + 
+  geom_point(aes(colour = Treatment), size = 4) +
+  xlab("Physiology") +
+  ylab("PCoA1") +
+  ggtitle("WUPCoA1 by Physiology on rlog transformed data") +
+  theme_bw() +
+  theme(text = element_text(size = 16)) 
+```

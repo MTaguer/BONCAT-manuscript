@@ -1,0 +1,996 @@
+---
+title: "BONCAT GitHub Sep 2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+#Setup
+```{r}
+library("phyloseq")
+library("tidyverse")
+library("qiime2R")
+library("ggpubr")
+library("RColorBrewer")
+library("data.table")
+library("ggridges")
+library(vegan)
+setwd("/Users/mariia/OneDrive - McGill University/grad school OneDrive/Healthy Human Facs Seq/QIIMEOutputProperFiltering/")
+```
+#Import
+```{r}
+setwd("/Users/mariia/OneDrive - McGill University/grad school OneDrive/Healthy Human Facs Seq/QIIMEOutputProperFiltering/")
+
+ps <- qza_to_phyloseq("HH-table.qza","HH-rooted-tree.qza","HH-taxonomy.qza")
+my_otu <- otu_table(ps)
+my_tree <- phy_tree(ps)
+my_taxa <- tax_table(ps)
+metadata<-read_tsv("HH-metadata-phyloseq.txt")
+my_meta <- sample_data(metadata)
+sample_names(my_meta) <- metadata$sampleid
+ps2 <- phyloseq(my_otu, my_tree, my_taxa, my_meta)
+ps2
+#check to see that all my sample ids match within my phyloseq object
+v1<-gplots::venn(list(metadata=rownames(my_meta), featuretable=colnames(my_otu)))
+v1
+v2<-gplots::venn(list(metadata=rownames(my_otu), featuretable=rownames(my_taxa)))
+v2
+```
+#Silva taxonomy adjustment
+```{r}
+#So qza_to_phyloseq was made to work with the greengenes database and how they annotate. Since I am using silva, the taxonomy wasn't parsed correctly, and the whole string was under Kingdom. This code goes into the kingdom column, and removes everything with D_\\d__ and seperates it by the proper taxa names
+tax <- data.frame(phyloseq::tax_table(ps2)[, 1]) %>%
+  mutate(Kingdom = stringr::str_replace_all(Kingdom, "D_\\d__", ""))
+tax <- tax %>%
+  tidyr::separate(Kingdom, c("Kingdom", "Phylum", "Class", "Order", "Family", "Genus", "Species"), sep = ";")
+
+tax_mat <- as.matrix(tax)
+rownames(tax_mat) <- phyloseq::taxa_names(ps)
+phyloseq::tax_table(ps2) <- tax_mat
+```
+#Basic plots on unfiltered data
+```{r}
+p <- plot_bar(ps2, facet_grid = ~Individual, fill = "Phylum", x = "Physiology")
+p + geom_col(aes(width = 3))
+
+#let's make the colour coding consistent first
+phylumGlom <- tax_glom(ps2, "Phylum") #the original phyloseq object, but now glommed by phyla
+getPalette = colorRampPalette(brewer.pal(9, "Spectral"))
+speciesList = unique(tax_table(phylumGlom)[,"Phylum"])
+speciesPalette = getPalette(length(speciesList))
+names(speciesPalette) = speciesList
+ 
+PhylumGlomBarplot <- plot_bar(phylumGlom, x = "Physiology", fill = "Phylum") +
+  scale_fill_manual(values= speciesPalette) +
+  theme_bw()
+
+#Histogram of sequencing depth
+sdt <- data.table(as(sample_data(ps2), "data.frame"),
+                 TotalReads = sample_sums(ps2), keep.rownames = TRUE)
+setnames(sdt, "rn", "SampleID")
+pSeqDepth <- ggplot(sdt, aes(TotalReads, fill = Individual)) + geom_histogram() + ggtitle("Sequencing Depth")
+pSeqDepth
+```
+#Filtering
+```{r}
+#I want to filter out what's contamination. The goal with that is remove whatever ASVs are present in the SF, but completely absent from the DNA, and remove that ASV completely from... that Individual? or the whole phyloseq object? (I had before completely removed it)
+
+#If >0 in SF, but ==0 in DNA, remove!
+
+#return taxa names that are present in sheath fluid
+SF <- subset_samples(ps2, Physiology == "SF")
+#only keep taxa that are present >0
+SF <- prune_taxa(taxa_sums(SF) > 0, SF) 
+SFnames <- taxa_names(SF) #taxa that are present in sheath fluid, 118 taxa present in the sheath fluid
+DNAps2 <- subset_samples(ps2, Physiology == "WC")
+DNAps2 <- prune_taxa(taxa_sums(DNAps2) < 1, DNAps2) 
+otu_table(DNAps2)
+DNAps2names <- taxa_names(DNAps2) #taxa that are absent from DNA There are 2109 taxa that are not present in the DNA samples
+#Now I want to find the intersection between SFnames and DNAps2names (ie found in SF, but absent from DNA, as in the name DNAps2names)
+Taxa_to_filter <- intersect(SFnames, DNAps2names)
+#there are 69 taxa that are present in sheath fluid but absent from DNA 
+Taxa_to_keep <- setdiff(taxa_names(ps2), Taxa_to_filter)
+length(Taxa_to_keep)
+ps2_NoSF <- prune_taxa(Taxa_to_keep, ps2)
+ps2_NoSF
+
+#barplot of unfiltered but sf contam removed
+
+ps2_NoSF_GlomP <- tax_glom(ps2_NoSF, "Phylum")
+
+ps2_NoSF_mergeGlomP <- merge_samples(ps2_NoSF, "Physiology")
+
+ps2_NoSF_GlomPplot <- plot_bar(ps2_NoSF_GlomP, x = "Physiology", fill = "Phylum") +
+  scale_fill_manual(values= speciesPalette) +
+  theme_bw()
+ps2_NoSF_GlomPplot 
+
+#Bioconductor Workflow for Microbiome Data Analysis: from raw reads to community analyses [version 2; peer review: approved]
+
+#Remove those where taxa is unassigned past bacteria (no phyla designation)
+table(tax_table(ps2_NoSF)[, "Phylum"], exclude = NULL)
+table(tax_table(ps2)[, "Phylum"], exclude = NULL)
+# Create table, number of features for each phyla
+ps0 <- subset_taxa(ps2_NoSF, !is.na(Phylum) & !Phylum %in% c("", "uncharacterized"))
+# Compute prevalence of each feature, store as data.frame
+prevdf = apply(X = otu_table(ps0),
+ MARGIN = ifelse(taxa_are_rows(ps0), yes = 1, no = 2),
+ FUN = function(x){sum(x > 0)})
+# Add taxonomy and total read counts to this data.frame
+prevdf = data.frame(Prevalence = prevdf,
+ TotalAbundance = taxa_sums(ps0),
+ tax_table(ps0))
+plyr::ddply(prevdf, "Phylum", function(df1){cbind(mean(df1$Prevalence),sum(df1$Prevalence))})
+#list of phyla to remove
+PhylatoFiler = c("Acidobacteria", "Lentisphaerae", "Patescibacteria", "Planctomycetes", "WPS-2", "Cyanobacteria")
+ps3 <- subset_taxa(ps0, !Phylum %in% PhylatoFiler)
+ps3 #went from 3077 taxa to 3056
+
+#Distrubtion of read counts
+tdt3 = data.table(tax_table(ps3),
+                 TotalCounts = taxa_sums(ps3),
+                 OTU = taxa_names(ps3))
+ggplot(tdt3, aes(TotalCounts)) + 
+  geom_histogram(bins=100) + 
+  ggtitle("Histogram of Total Counts") +
+  xlim(0,100)
+
+# How many singletons?
+tdt3[(TotalCounts <= 0), .N]
+# How many doubletons?
+tdt3[(TotalCounts <= 2), .N]
+#How many 5ers
+tdt3[(TotalCounts <= 5), .N]
+
+# taxa cumulative sum
+taxcumsum3 = tdt3[, .N, by = TotalCounts]
+setkey(taxcumsum3, TotalCounts)
+taxcumsum3[, CumSum := cumsum(N)]
+# Define the plot
+pCumSum3 = ggplot(taxcumsum3, aes(TotalCounts, CumSum)) + 
+  geom_point() +
+  xlab("Filtering Threshold, Minimum Total Counts") +
+  ylab("OTUs Filtered") +
+  ggtitle("OTUs that would be filtered vs. the minimum count threshold")
+pCumSum3
+
+#zoom in
+pCumSum3 + xlim(0, 50)
+
+source("~/taxa_summary.R")
+
+mdt3 = fast_melt(ps3)
+prevdt3 = mdt3[, list(Prevalence = sum(count > 0), 
+                    TotalCounts = sum(count)),
+             by = taxaID]
+
+# Source the file that defines the new functions
+source("~/taxa_summary.R", local = TRUE)
+ggplot(prevdt3, aes(Prevalence)) + 
+  geom_histogram(bins=50) + 
+  ggtitle("Histogram of Taxa Prevalence")
+
+#363 taxa would be filtered if we set the minimum count to 5 
+
+#Plot total counts vs prevalence 
+ggplot(prevdt3, aes(Prevalence, TotalCounts)) + 
+  geom_point(size = 4, alpha = 0.75) + 
+  scale_y_log10()
+#same scatter plot but now coloured by taxa
+addPhylum3 = unique(copy(mdt3[, list(taxaID,Phylum)]))
+# Join by TaxaID
+setkey(prevdt3, taxaID)
+setkey(addPhylum3, taxaID)
+prevdt3 <- addPhylum3[prevdt3]
+showPhyla3 = prevdt3[, sum(TotalCounts), by = Phylum][order(-V1)][1:9]$Phylum
+setkey(prevdt3, Phylum)
+
+ggplot(prevdt3[showPhyla3], 
+       mapping = aes(Prevalence, TotalCounts, colour = Phylum)) + 
+  geom_point(size = 3) + 
+  scale_colour_brewer(palette = "Paired") +
+  scale_y_log10() +
+  xlim(0,20) + #zooming in to see what phyla are responsable for less prevalent taxa
+  ylim(0,1000)
+
+#Based on all this, the least stringent, but necessary filtering I will do is it ha to be present in at least 2 samples, with a count of at least 6. (maybe I should move it up to 3 samples)
+ps4 <- filter_taxa(ps3, function(x) sum(x > 5) > (0.033*length(x)), TRUE) #840 taxa
+ps4Glom <- tax_glom(ps4, "Phylum")
+ps4_GlomPplot <- plot_bar(ps4Glom, x = "Physiology", fill = "Phylum") +
+  scale_fill_manual(values= speciesPalette) +
+  theme_bw() #saved as ps4
+
+#Where is that pseudomonas?
+#645dd8b575c7e7c0952933bbe90b4bb9 and 509f1f09b18a33b87b49b2e80cc8bdfe first does not have any present in DNA, and the second, only in one DNA sample, count of seven, count of 7.
+pseudomonas <- prune_taxa(c("645dd8b575c7e7c0952933bbe90b4bb9", "509f1f09b18a33b87b49b2e80cc8bdfe"), ps4)
+ps5names <- setdiff(taxa_names(ps4), taxa_names(pseudomonas))
+ps5 <- prune_taxa(ps5names, ps4)
+Controls <- c("SF", "PCRNeg", "PCRPos", "rPBS", "WC-S", "US", "BWC", "BUS", "US-S", "US-PI")
+ps5NC <- subset_samples(ps5, !Physiology %in% Controls)
+```
+#Figure 3a Basic plots of filtered data
+```{r}
+#Basic barplot
+ps5NCRAPhys <- merge_samples(ps5NC, "Physiology") #now row titles are physiology
+ps5NCRAPhysRA <- transform_sample_counts(ps5NCRAPhys, function(x) x / sum(x) )
+ps5NCRAPhysRAGlom <- tax_glom(ps5NCRAPhysRA, "Phylum")
+plot_bar(ps5NCRAPhysRAGlom, fill = "Phylum") +
+  scale_fill_manual(values= speciesPalette) +
+  theme_bw() +
+  theme(text = element_text(size = 16)) 
+
+ps5NCnoH <- subset_samples(ps5NC, sampleid != c("HHneg", "HHpos")) 
+```
+#Figure S3 Plots comparing unfiltered to filtered
+```{r}
+#Remove all controls but sheath fluid
+ps2NC <- subset_samples(ps2, Physiology %in% c("BCpos", "BCneg", "WC", "HNA", "LNA", "PI", "SF"))
+ps2NCGlomP <- tax_glom(ps2NC, "Phylum")
+ps2NCGlomPplot <- plot_bar(ps2NCGlomP, x = "Physiology", fill = "Phylum") +
+  scale_fill_manual(values= speciesPalette) +
+  theme_bw()
+
+ps5Glom <- tax_glom(ps5, "Phylum")
+ps5Glom <- subset_samples(ps5Glom, Physiology %in% c("BCpos", "BCneg", "WC", "HNA", "LNA", "PI", "SF"))
+ps5_NoSF_GlomPplot <- plot_bar(ps5Glom, x = "Physiology", fill = "Phylum") +
+  scale_fill_manual(values= speciesPalette) +
+  theme_bw()
+
+ps2_NoSF_GlomPplot
+
+ps5_NoSF_GlomPplot
+
+ps5NCGenus <- tax_glom(ps5NCnoH, "Genus")
+Top10Genus <- names(sort(taxa_sums(ps5NCGenus), TRUE)[1:10])
+Top10Genusps5 <- prune_species(Top10Genus, ps5NCGenus)
+#Take what is not in top 10 and name as other
+AllGenus <- taxa_names(ps5NCGenus)
+OtherGenera <- setdiff(AllGenus, Top10Genus) #"c8d2b3167ef685d221379c95b2553a66"
+ps5NC_TopGenus <- merge_taxa(ps5NCGenus, OtherGenera, 1)
+ps5NC_TopGenus2 <- tax_glom(ps5NC_TopGenus, "Genus")
+
+plot_bar(ps5NC_TopGenus, x = "Physiology", fill = "Genus") +
+  theme_bw()
+
+#Genus level of the sheath fluid
+ps2SF <- subset_samples(ps2, Physiology =="SF")
+ps2SFgenus <- tax_glom(ps2SF, "Genus")
+Top10Genus <- names(sort(taxa_sums(ps2SFgenus), TRUE)[1:10])
+Top10Genusps2 <- prune_species(Top10Genus, ps2SFgenus)
+#Take what is not in top 10 and name as other
+AllGenus <- taxa_names(ps2SFgenus)
+OtherGenera <- setdiff(AllGenus, Top10Genus) #"c8d2b3167ef685d221379c95b2553a66"
+ps2SFgenus1 <- merge_taxa(ps2SFgenus, OtherGenera, 1)
+ps2SFgenus <- tax_glom(ps2SFgenus1, "Genus")
+Allf1 <- plot_bar(ps2SFgenus, fill = "Genus", x = "sampleid", title = "Neg Controls")
+Allf1 + theme_bw()
+```
+
+#Alpha diversity, Faith and Shannon
+```{r}
+plot_richness(ps3, measures=c("Chao1", "Shannon"))
+plot_richness(ps5, measures=c("Chao1", "Shannon"))
+```
+#FIGURE 3 Taxonomy barplots with permanova and PCoA
+```{r}
+ps5NCRAPhys <- merge_samples(ps5NC, "Physiology") #now row titles are physiology
+ps5NCRAPhysRA <- transform_sample_counts(ps5NCRAPhys, function(x) x / sum(x) )
+ps5NCRAPhysRAGlom <- tax_glom(ps5NCRAPhysRA, "Phylum")
+
+ps5NCPhylum <- tax_glom(ps5NC, "Phylum")
+ps5NC_RA <- transform_sample_counts(ps5NCPhylum , function(x) x / sum(x) )
+
+plot_bar(ps5NCRAPhysRAGlom, fill = "Phylum") +
+  scale_fill_manual(values= speciesPalette) +
+  theme_bw() +
+  theme(text = element_text(size = 16)) 
+
+plot_bar(ps5NC_RA, x = "Physiology", fill = "Phylum", facet_grid = "Individual") +
+  scale_fill_manual(values= speciesPalette) +
+  theme_bw() +
+  theme(text = element_text(size = 16)) 
+
+#Top Ten Genus plot
+ps5NCGenus <- tax_glom(ps5NCnoH, "Genus")
+Top10Genus <- names(sort(taxa_sums(ps5NCGenus), TRUE)[1:10])
+Top10Genusps5 <- prune_species(Top10Genus, ps5NCGenus)
+#Take what is not in top 10 and name as other
+AllGenus <- taxa_names(ps5NCGenus)
+OtherGenera <- setdiff(AllGenus, Top10Genus) #"c8d2b3167ef685d221379c95b2553a66"
+ps5NC_TopGenus <- merge_taxa(ps5NCGenus, OtherGenera, 1)
+#Merge, transform to relative abundance
+ps5NC_TopGenusRA <- transform_sample_counts(ps5NC_TopGenus , function(x) x / sum(x) )
+ps5NC_TopGenusRAPhys <- merge_samples(ps5NC_TopGenusRA, "Physiology") #now row titles are physiology
+ps5NC_TopGenusRAPhysRA <- transform_sample_counts(ps5NC_TopGenusRAPhys , function(x) x / sum(x) )
+plot_bar(ps5NC_TopGenusRAPhysRA, fill = "Genus") +
+  theme_bw() +
+  theme(text = element_text(size = 16)) 
+
+plot_bar(ps5NC_TopGenusRA, x= "Physiology", fill = "Genus", facet_grid = "Individual") +
+  theme_bw() +
+  theme(text = element_text(size = 16)) 
+
+```
+#Fig4a Weighted UniFrac boxplots Using rbiom
+```{r}
+#install.packages("rbiom")
+library("rbiom")
+library(gdata)
+library(ggpubr)
+counts = otu_table(ps5NC)
+tree = phy_tree(ps5NC)
+rbiom_weighted = rbiom::unifrac(counts, weighted=TRUE, tree=tree)
+
+matrix_to_column <- function(distance_matrix, physiology) {
+  distance_matrix <- as.matrix(distance_matrix)
+  distance_matrix <- as.data.frame(distance_matrix)
+  WU_phys <- dplyr::select(distance_matrix, ends_with(physiology)) #removes unnecessary columns
+  WU_phys <- setDT(WU_phys, keep.rownames = TRUE) #makes rownames into a column called rn
+  WU_phys <- dplyr::filter(WU_phys, grepl(physiology, rn))
+  WU_phys <- upperTriangle(WU_phys, diag= FALSE)
+  WU_phys <- as.numeric(WU_phys)
+  WU_phys <- WU_phys[ WU_phys != 0 ] 
+  return(WU_phys)
+  }
+
+HNA <- matrix_to_column(rbiom_weighted, "HNA")
+LNA <- matrix_to_column(rbiom_weighted, "LNA")
+DNA <- matrix_to_column(rbiom_weighted, "DNA")
+Hpos <- matrix_to_column(rbiom_weighted, "Hpos")
+Hneg <- matrix_to_column(rbiom_weighted, "Hneg")
+PI <- matrix_to_column(rbiom_weighted, "PI")
+#all are length 45
+WU.df <- data.frame(DNA, HNA, LNA, PI, Hpos, Hneg)
+WU.df
+sapply(WU.df, shapiro.test)
+#LNA and Hneg are not normally distributed, so should used KW
+WU.df <- gather(WU.df, "Physiology", "value")
+
+my_comparisons <- list(c("WC", "HNA"), c("WC", "LNA"), c("WC", "PI"), c("WC", "BCpos"), c("WC", "BCneg"), c("BCpos", "BCneg"), c("HNA", "LNA"))
+
+library(rstatix)
+
+kruskal.test(value ~ Physiology, data = WU.df)
+pairwise.wilcox.test(WU.df$value, WU.df$Physiology,
+                 p.adjust.method = "BH")
+#Plot
+p.wu.ps5 <- ggplot(WU.df, aes(x = Physiology, y = value)) +
+    theme_bw() +
+    geom_boxplot() +
+    geom_jitter(width = 0.2) +
+    ylab("Weighted Unifrac Distance") +
+    xlab("Physiology") +
+    theme(text = element_text(size = 16)) +
+  stat_compare_means(method = "kruskal.test") +
+  stat_pvalue_manual(pwc, hide.ns = TRUE, y.position = c(0.57, 0.65, 0.72, 0.97, 0.82, 0.92, 0.88, 0.77), size = 7) +
+  ylim(0.08, 0.99)
+p.wu.ps5
+```
+
+#DeSeq2 transformations for PCoA
+```{r}
+#Update BiocManager to the latest run for R 3.6
+# if (!requireNamespace("BiocManager", quietly = TRUE))
+#    install.packages("BiocManager")
+# BiocManager::install(version = "3.10")
+
+# BiocManager::install("DESeq2")
+
+library("DESeq2")
+ps5NC.DS = phyloseq_to_deseq2(ps5NC, Physiology ~ Individual)
+#add pseucount
+ps5NC.DS.pseudo <- ps5NC.DS@assays@data$counts + 1
+#vst transformation
+dds.vst <- varianceStabilizingTransformation(ps5NC.DS.pseudo)
+dds.rlog <- rlog(ps5NC.DS.pseudo)
+
+# making our phyloseq object with transformed table, adding back in the original tree and taxonomy
+vst_count_phy <- otu_table(dds.vst, taxa_are_rows=T)
+sample_info_tab_phy <- sample_data(ps5NC)
+vst_physeq <- phyloseq(vst_count_phy, sample_info_tab_phy, tax_table(ps5NC), phy_tree(ps5NC))
+
+rlog_count_phy <- otu_table(dds.rlog, taxa_are_rows=T)
+taxa_names(rlog_count_phy) <- taxa_names(vst_count_phy)
+rlog_physeq <- phyloseq(rlog_count_phy, sample_info_tab_phy, tax_table(ps5NC), phy_tree(ps5NC))
+```
+
+#Fig2cdef PCoA plots with transformed data
+```{r}
+counts = otu_table(rlog_physeq)
+tree = phy_tree(rlog_physeq)
+rbiom_weighted.rlog = rbiom::unifrac(counts, weighted=TRUE, tree=tree)
+rbiom_unweighted.rlog = rbiom::unifrac(counts, weighted=FALSE, tree=tree)
+## Rlog WU
+pcoa.rlog = ordinate(rlog_physeq, method="PCoA", distance=rbiom_weighted.rlog)
+# Physiology 
+plot_ordination(rlog_physeq, pcoa.rlog, "samples", color="Physiology", title = "WUnifrac PCoA, rlog") + 
+  geom_point(size=3) + theme_bw() +  theme(text = element_text(size = 16)) + scale_colour_brewer(palette = "Paired")
+
+# Individaul 
+plot_ordination(rlog_physeq, pcoa.rlog, "samples", color="Individual", title = "WUnifrac PCoA, rlog") + 
+  geom_point(size=3) + theme_bw() +  theme(text = element_text(size = 16)) + scale_colour_brewer(palette = "Paired")
+
+
+#Axis.1 under $vectors and cbind by row title (sampleid) to metadata dataframe
+metadata <- as(sample_data(ps5NCnoH), "data.frame")
+wu.rlog <- as.data.frame(pcoa.rlog$vectors)
+wu.rlog <- rownames_to_column(wu.rlog, var = "sampleid")
+wu.rlog = left_join(wu.rlog, metadata, by = "sampleid")
+
+ggplot(wu.rlog, aes(Individual, Axis.1)) + 
+  geom_point(aes(color = Physiology), size = 4) +
+  xlab("Individual") +
+  ylab("PCoA1") +
+  ggtitle("WUPCoA1 by Individual on rlog transformed data") +
+  theme_bw() +
+  theme(text = element_text(size = 16)) +
+  scale_colour_brewer(palette = "Paired")
+
+
+ggplot(wu.rlog, aes(Individual, Axis.2)) + 
+  geom_point(aes(color = Physiology), size = 4) +
+  xlab("Individual") +
+  ylab("PCoA2") +
+  ggtitle("WUPCoA2 by Individual on rlog transformed data") +
+  theme_bw() +
+  theme(text = element_text(size = 16)) +
+  scale_colour_brewer(palette = "Paired")
+```
+#Permanova on transformed data
+```{r}
+adonis(rbiom_weighted.rlog ~ Physiology,
+       data = as(sample_data(rlog_physeq), "data.frame"))
+adonis(rbiom_weighted.rlog ~ Individual,
+       data = as(sample_data(rlog_physeq), "data.frame"))
+
+
+
+
+#phylum
+#Let's do pairwise permanovas
+#remove HHpos and HHneg
+ps5Glom <- tax_glom(rlog_physeq, "Phylum")
+ps5Glom <- subset_samples(ps5Glom, sampleid != "HHpos")
+
+ps5.1 <- subset_samples(ps5Glom, Physiology %in% c("BCpos", "BCneg")) #0.327
+ps5.2 <- subset_samples(ps5Glom, Physiology %in% c("HNA", "LNA")) # 0.006
+ps5.3 <- subset_samples(ps5Glom, Physiology %in% c("WC", "HNA")) #0.018
+ps5.4 <- subset_samples(ps5Glom, Physiology %in% c("WC", "LNA")) #0.152
+ps5.5 <- subset_samples(ps5Glom, Physiology %in% c("WC", "BCpos")) #0.661
+ps5.6 <- subset_samples(ps5Glom, Physiology %in% c("WC", "BCneg")) #0.647
+ps5.7 <- subset_samples(ps5Glom, Physiology %in% c("WC", "PI")) # 0.387
+ps5.8 <- subset_samples(ps5Glom, Physiology %in% c("BCpos", "HNA")) #0.009
+ps5.9 <- subset_samples(ps5Glom, Physiology %in% c("BCneg", "LNA")) #0.155
+ps5.10 <- subset_samples(ps5Glom, Physiology %in% c("BCneg", "PI")) #0.087
+
+adonis(rbiom::unifrac(otu_table(ps5.1), weighted=TRUE, tree=phy_tree(ps5.1)) ~ Physiology,
+       data = as(sample_data(ps5.1), "data.frame"))
+adonis(rbiom::unifrac(otu_table(ps5.2), weighted=TRUE, tree=phy_tree(ps5.2)) ~ Physiology,
+       data = as(sample_data(ps5.2), "data.frame"))
+adonis(rbiom::unifrac(otu_table(ps5.3), weighted=TRUE, tree=phy_tree(ps5.3)) ~ Physiology,
+       data = as(sample_data(ps5.3), "data.frame"))
+adonis(rbiom::unifrac(otu_table(ps5.4), weighted=TRUE, tree=phy_tree(ps5.4)) ~ Physiology,
+       data = as(sample_data(ps5.4), "data.frame"))
+adonis(rbiom::unifrac(otu_table(ps5.5), weighted=TRUE, tree=phy_tree(ps5.5)) ~ Physiology,
+       data = as(sample_data(ps5.5), "data.frame"))
+adonis(rbiom::unifrac(otu_table(ps5.6), weighted=TRUE, tree=phy_tree(ps5.6)) ~ Physiology,
+       data = as(sample_data(ps5.6), "data.frame"))
+adonis(rbiom::unifrac(otu_table(ps5.7), weighted=TRUE, tree=phy_tree(ps5.7)) ~ Physiology,
+       data = as(sample_data(ps5.7), "data.frame"))
+adonis(rbiom::unifrac(otu_table(ps5.8), weighted=TRUE, tree=phy_tree(ps5.8)) ~ Physiology,
+       data = as(sample_data(ps5.8), "data.frame"))
+adonis(rbiom::unifrac(otu_table(ps5.9), weighted=TRUE, tree=phy_tree(ps5.9)) ~ Physiology,
+       data = as(sample_data(ps5.9), "data.frame"))
+adonis(rbiom::unifrac(otu_table(ps5.10), weighted=TRUE, tree=phy_tree(ps5.10)) ~ Physiology,
+       data = as(sample_data(ps5.10), "data.frame"))
+
+
+#Genus
+#Let's do pairwise permanovas
+#remove HHpos and HHneg
+ps5Glom <- tax_glom(rlog_physeq, "Genus")
+ps5Glom <- subset_samples(ps5Glom, sampleid != "HHpos")
+ps5.1 <- subset_samples(ps5Glom, Physiology %in% c("BCpos", "BCneg")) #0.391
+ps5.2 <- subset_samples(ps5Glom, Physiology %in% c("HNA", "LNA")) # 0.014
+ps5.3 <- subset_samples(ps5Glom, Physiology %in% c("WC", "HNA")) #0.111
+ps5.4 <- subset_samples(ps5Glom, Physiology %in% c("WC", "LNA")) #0.183
+ps5.5 <- subset_samples(ps5Glom, Physiology %in% c("WC", "BCpos")) #0.123
+ps5.6 <- subset_samples(ps5Glom, Physiology %in% c("WC", "BCneg")) #0.069
+ps5.7 <- subset_samples(ps5Glom, Physiology %in% c("WC", "PI")) # 0.388
+ps5.8 <- subset_samples(ps5Glom, Physiology %in% c("BCpos", "HNA")) #0.042
+ps5.9 <- subset_samples(ps5Glom, Physiology %in% c("BCneg", "LNA")) #0.045
+ps5.10 <- subset_samples(ps5Glom, Physiology %in% c("BCneg", "PI")) #0.263
+
+adonis(rbiom::unifrac(otu_table(ps5.1), weighted=TRUE, tree=phy_tree(ps5.1)) ~ Physiology,
+       data = as(sample_data(ps5.1), "data.frame"))
+adonis(rbiom::unifrac(otu_table(ps5.2), weighted=TRUE, tree=phy_tree(ps5.2)) ~ Physiology,
+       data = as(sample_data(ps5.2), "data.frame"))
+adonis(rbiom::unifrac(otu_table(ps5.3), weighted=TRUE, tree=phy_tree(ps5.3)) ~ Physiology,
+       data = as(sample_data(ps5.3), "data.frame"))
+adonis(rbiom::unifrac(otu_table(ps5.4), weighted=TRUE, tree=phy_tree(ps5.4)) ~ Physiology,
+       data = as(sample_data(ps5.4), "data.frame"))
+adonis(rbiom::unifrac(otu_table(ps5.5), weighted=TRUE, tree=phy_tree(ps5.5)) ~ Physiology,
+       data = as(sample_data(ps5.5), "data.frame"))
+adonis(rbiom::unifrac(otu_table(ps5.6), weighted=TRUE, tree=phy_tree(ps5.6)) ~ Physiology,
+       data = as(sample_data(ps5.6), "data.frame"))
+adonis(rbiom::unifrac(otu_table(ps5.7), weighted=TRUE, tree=phy_tree(ps5.7)) ~ Physiology,
+       data = as(sample_data(ps5.7), "data.frame"))
+adonis(rbiom::unifrac(otu_table(ps5.8), weighted=TRUE, tree=phy_tree(ps5.8)) ~ Physiology,
+       data = as(sample_data(ps5.8), "data.frame"))
+adonis(rbiom::unifrac(otu_table(ps5.9), weighted=TRUE, tree=phy_tree(ps5.9)) ~ Physiology,
+       data = as(sample_data(ps5.9), "data.frame"))
+adonis(rbiom::unifrac(otu_table(ps5.10), weighted=TRUE, tree=phy_tree(ps5.10)) ~ Physiology,
+       data = as(sample_data(ps5.10), "data.frame"))
+
+#ASV
+ps5.11 <- subset_samples(rlog_physeq, Physiology %in% c("HNA", "LNA")) # p = 0.014
+adonis(rbiom::unifrac(otu_table(ps5.11), weighted=TRUE, tree=phy_tree(ps5.11)) ~ Physiology,
+       data = as(sample_data(ps5.11), "data.frame"))
+adonis(rbiom::unifrac(otu_table(ps5.11), weighted=FALSE, tree=phy_tree(ps5.11)) ~ Physiology,
+       data = as(sample_data(ps5.11), "data.frame")) #Gives zeros as results, can't do unweighted for some reason on transformed?
+
+ps5.12 <- subset_samples(rlog_physeq, Physiology %in% c("HNA", "BCpos")) # p = 0.014
+adonis(rbiom::unifrac(otu_table(ps5.12), weighted=TRUE, tree=phy_tree(ps5.12)) ~ Physiology,
+       data = as(sample_data(ps5.12), "data.frame"))
+```
+#Pairwise permanovas for a table
+```{r}
+library(devtools)
+#install_github("pmartinezarbizu/pairwiseAdonis/pairwiseAdonis")
+library(pairwiseAdonis)
+Rar_unweighted.df <- pairwise.adonis(Rar_unweighted, sample_data(ps5NHnoHrar)$Physiology, p.adjust.m = "fdr")
+Rar_weighted.df <- pairwise.adonis(Rar_weighted, sample_data(ps5NHnoHrar)$Physiology, p.adjust.m = "fdr")
+write.csv(Rar_unweighted.df, "Rar_unweighted_adonis.csv")
+write.csv(Rar_weighted.df, "Rar_weighted_adonis.csv")
+```
+
+
+
+
+#Fig4b Core, Shared, and Unique Taxa
+```{r}
+#Do taxa that are present in all individuals, where do they show up?
+ps5NC
+#840 taxa
+#Have to remove the corresponding Hnegative population from the indvidual where we don't have BC+
+ps5NCnoH <- subset_samples(ps5NC, sampleid != c("HHneg", "HHpos")) 
+#subset DNA
+DNAOTU <- subset_samples(ps5NCnoH, Physiology == "WC")
+#838 taxa
+
+#Taxa present at least once in 90% of samples
+DNAOTUAll <- filter_taxa(DNAOTU, function(x) sum(x > 0) > (0.9*length(x)), TRUE)
+#only 12 taxa are found in all DNA samples! same as what is present in 90% of taxa
+#32 taxa are found at least onces in 80% of individuals DNA
+#Let's go forward with the 12 taxa that are present in all
+
+#then get the names of the OTUs out, and use that as the filtering requirement
+DNATaxa <- taxa_names(DNAOTUAll)
+ps5_core <- prune_taxa(DNATaxa, ps5NCnoH)  #this only has those core 12 taxa
+
+#Core, Unique, Other
+#taxa present at least once in 90% of samples
+Unique1 <- filter_taxa(DNAOTU, function(x) sum(x > 0) < (0.2*length(x)), TRUE) #479 taxa
+Unique2 <- filter_taxa(DNAOTU, function(x) sum(x > 0) < (0.3*length(x)), TRUE) #591 taxa
+#477 taxa are found in only one individual 
+#591 taxa are found in 2 or less individuals
+
+plot_bar(Unique1, fill = "Order", title = "Unique 1", x = "Physiology")
+plot_bar(Unique2, fill = "Order", title = "Unique 2")
+#The graphs are unique enough that I should do this on both
+
+ps5NCnoH <- subset_samples(ps5NC, sampleid != c("HHneg", "HHpos")) 
+
+#List the names of the unique taxa
+Unique1Names <- taxa_names(Unique1) #479  "c8d2b3167ef685d221379c95b2553a66"
+Unique2Names <- taxa_names(Unique2)  #593 "c8d2b3167ef685d221379c95b2553a66"
+#merge unique
+ps5_Uni1CorOth <- merge_taxa(ps5NCnoH, Unique1Names, 1) #362 taxa
+ps5_Uni2CorOth <- merge_taxa(ps5NCnoH, Unique2Names, 1) #248 taxa
+#merge core
+ps5_Uni1CorOth <- merge_taxa(ps5_Uni1CorOth, DNATaxa, 1) #351 taxa
+ps5_Uni2CorOth <- merge_taxa(ps5_Uni2CorOth, DNATaxa, 1) #237 taxa
+
+#Take what is not in core or unqiue and name as other
+AllTaxaNames <- taxa_names(DNAOTU) # core "3e1f0a5b4f0c2e1ae51a17f597536337"
+Rare <- setdiff(AllTaxaNames, DNATaxa)
+Other1 <- setdiff(Rare, Unique1Names) #"950c432d4df367cfd29389f23c4272f6"
+Other2 <- setdiff(Rare, Unique2Names) #"950c432d4df367cfd29389f23c4272f6" 
+#Now merging other
+ps5_Uni1CorOth <- merge_taxa(ps5_Uni1CorOth, Other1, 1)
+ps5_Uni2CorOth <- merge_taxa(ps5_Uni2CorOth, Other2, 1)
+ps5_Uni1CorOth #3 taxa in all my samples, unique defined as found in 1 individual 
+ps5_Uni2CorOth #3 taxa in all my samples, unique defined as found in 2 individuals
+
+
+#Consistent colouring for Unique, Core, and Shared
+library("RColorBrewer")
+getPalette <- colorRampPalette(brewer.pal(3, "Paired"))
+
+ps5Glom <- tax_glom(ps5, "Phylum")
+CoreUniqueRare <- unique(tax_table(ps5Glom))
+CoreUniqueRarePalette <- getPalette(length(CoreUniqueRare))
+names(CoreUniqueRarePalette) <- CoreUniqueRare
+
+#turn into relative abundance
+ps5_Uni1CorOth_RA  <- transform_sample_counts(ps5_Uni1CorOth, function(x) x / sum(x) )
+#merge by physiology
+ps5_Uni1CorOth_RAMerge <- merge_samples(ps5_Uni1CorOth_RA, "Physiology") 
+#Relative abundance again to account for variation in sample number
+ps5_Uni1CorOth_RAMerge2  <- transform_sample_counts(ps5_Uni1CorOth_RAMerge, function(x) x / sum(x) )
+
+cols <- c("f966e124604e0e32b209b88df6e42cd4" = "#999999", "3e1f0a5b4f0c2e1ae51a17f597536337" =  "#999999", "098c3bbd8234f4ac198297ac0bde957d" = "#56B4E9", "891b892b421f8fedc98490e66b113814" = "#0072B2", "950c432d4df367cfd29389f23c4272f6" = "#56B4E9", "04f226475733296b42c88bc7eef2af1e" = "#0072B2", "c8d2b3167ef685d221379c95b2553a66" = "#0072B2")
+
+plot_bar(ps5_Uni1CorOth_RAMerge2, title = "Core, Unique, and Shared Taxa 1", fill = "OTU") +
+  theme_bw() +
+  scale_fill_manual(values = cols)
+ggsave("Core,Unique, Shared 1 barplot.pdf")
+
+#turn into relative abundance
+ps5_Uni2CorOth_RA  <- transform_sample_counts(ps5_Uni2CorOth, function(x) x / sum(x) )
+#merge by physiology
+ps5_Uni2CorOth_RAMerge <- merge_samples(ps5_Uni2CorOth_RA, "Physiology") 
+#Relative abundance again to account for variation in sample number
+ps5_Uni2CorOth_RAMerge2  <- transform_sample_counts(ps5_Uni2CorOth_RAMerge, function(x) x / sum(x) )
+plot_bar(ps5_Uni2CorOth_RAMerge2, fill = "OTU", title = "Core, Unique, and Share Taxa 2") +
+  theme_bw() +
+  scale_fill_manual(values = cols)
+ggsave("Core,Unique, Shared 2 barplot.pdf")
+
+#Betadispersion
+betadisp2 <- betadisper(rbiom::unifrac(otu_table(ps5_Uni2CorOth), weighted=TRUE, tree=phy_tree(ps5_Uni2CorOth)), metadata$Physiology)
+permutest(betadisp2)
+```
+
+#Corncob on Core Unique
+```{r}
+library(corncob)
+
+library(magrittr)
+#Core 1
+ps5_Uni1CorOthcc <- clean_taxa_names(ps5_Uni1CorOth, name = "OTU")
+corncob29 <- bbdml(formula = OTU1 ~ 1,
+                  phi.formula = ~ 1,
+                  data = ps5_Uni1CorOthcc)
+corncob30 <- bbdml(formula =  OTU1 ~ Physiology,
+                  phi.formula = ~ Physiology,
+                  data = ps5_Uni1CorOthcc)
+lrtest(mod_null = corncob29, mod = corncob30)
+#Yes 0.0006088684
+summary(corncob30)
+#The proportion of unique taxa is not significantly different between BC+ and Hneg
+plot(corncob30, color = "Physiology", title = "Core")
+ggsave("corncob30.pdf", width = 14)
+
+#Core 2
+ps5_Uni2CorOthcc <- clean_taxa_names(ps5_Uni2CorOth, name = "OTU")
+corncob31 <- bbdml(formula = OTU1 ~ 1,
+                  phi.formula = ~ 1,
+                  data = ps5_Uni2CorOthcc)
+corncob32 <- bbdml(formula =  OTU1 ~ Physiology,
+                  phi.formula = ~ Physiology,
+                  data = ps5_Uni2CorOthcc)
+lrtest(mod_null = corncob31, mod = corncob32)
+#Yes 0.0270239
+summary(corncob32)
+
+#Let's try all physiology on Unique
+
+ps5_Uni1CorOthcc <- clean_taxa_names(ps5_Uni1CorOth, name = "OTU")
+ps5_Uni2CorOthcc <- clean_taxa_names(ps5_Uni2CorOth, name = "OTU")
+tax_table(ps2_fsf_Uni2CorOthcc) #taxa names are the same when you dont subset to BONCAT
+
+#Unique 1
+corncob25 <- bbdml(formula = OTU3 ~ 1,
+                  phi.formula = ~ 1,
+                  data = ps5_Uni1CorOthcc)
+corncob26 <- bbdml(formula =  OTU3 ~ Physiology,
+                  phi.formula = ~ Physiology,
+                  data = ps5_Uni1CorOthcc)
+lrtest(mod_null = corncob25, mod = corncob26)
+#Yes 0.01102795
+summary(corncob26)
+#The proportion of unique taxa is not significantly different between BC+ and Hneg
+plot(corncob26, color = "Physiology", title = "Unique 1")
+
+#Unique 2
+corncob27 <- bbdml(formula = OTU3 ~ 1,
+                  phi.formula = ~ 1,
+                  data = ps5_Uni2CorOthcc)
+corncob28 <- bbdml(formula =  OTU3 ~ Physiology,
+                  phi.formula = ~ Physiology,
+                  data = ps5_Uni2CorOthcc)
+lrtest(mod_null = corncob27, mod = corncob28)
+#Yes 0.01102795
+summary(corncob28)
+```
+
+#Corncob
+```{r}
+library(corncob)
+library(phyloseq)
+library(magrittr)
+
+#Try it on the phylum level, without controls
+ps5Glom <- tax_glom(ps5, "Phylum")
+ps5NCGlom <- subset_samples(ps5Glom, Physiology%in%c("WC", "HNA", "LNA", "PI", "BCpos", "BCneg"))
+
+#both abundance and variability, without controlling for anything
+
+corncob1 <- differentialTest(formula = ~ Physiology,
+                        phi.formula = ~ Physiology,
+                        formula_null = ~ 1,
+                        phi.formula_null = ~ Physiology,
+                        data = ps5NCGlom,
+                        test = "Wald", boot = FALSE,
+                        fdr_cutoff = 0.05)
+plot(corncob1, level = "Phylum")
+
+corncob1$significant_taxa
+otu_to_taxonomy(OTU = corncob1$significant_taxa, data = ps5Glom)
+corncob1$p_fdr
+
+
+#Just DNA and HNA
+ps5NCGlomDNAHNA <- subset_samples(ps5Glom, Physiology%in%c("WC", "HNA"))
+corncob2 <- differentialTest(formula = ~ Physiology,
+                        phi.formula = ~ Physiology,
+                        formula_null = ~ 1,
+                        phi.formula_null = ~ Physiology,
+                        data = ps5NCGlomDNAHNA,
+                        test = "Wald", boot = FALSE,
+                        fdr_cutoff = 0.05)
+plot(corncob2, level = "Phylum")
+
+otu_to_taxonomy(OTU = corncob2$significant_taxa, data = ps5Glom)
+corncob2$p_fdr
+
+#Just PI and HNA
+ps5NCGlomPIHNA <- subset_samples(ps5Glom, Physiology %in% c("PI", "HNA"))
+corncobp <- differentialTest(formula = ~ Physiology,
+                        phi.formula = ~ Physiology,
+                        formula_null = ~ 1,
+                        phi.formula_null = ~ Physiology,
+                        data = ps5NCGlomPIHNA,
+                        test = "Wald", boot = FALSE,
+                        fdr_cutoff = 0.05)
+plot(corncobp, level = "Phylum")
+#broken
+otu_to_taxonomy(OTU = corncobp$significant_taxa, data = ps5Glom)
+corncobp$p_fdr
+
+
+#Just DNA and LNA #nothign is significanlty different
+#DNA and Hpos
+ps5NCGlomDNAHneg <- subset_samples(ps5Glom, Physiology%in%c("WC", "BCneg"))
+corncob3 <- differentialTest(formula = ~ Physiology,
+                        phi.formula = ~ Physiology,
+                        formula_null = ~ 1,
+                        phi.formula_null = ~ Physiology,
+                        data = ps5NCGlomDNAHneg,
+                        test = "Wald", boot = FALSE,
+                        fdr_cutoff = 0.05)
+plot(corncob3, level = "Phylum")
+
+otu_to_taxonomy(OTU = corncob3$significant_taxa, data = ps5Glom)
+corncob3$p_fdr
+
+ps5NCGlomDNAPI <- subset_samples(ps5Glom, Physiology%in%c("WC", "PI"))
+corncob4 <- differentialTest(formula = ~ Physiology,
+                        phi.formula = ~ Physiology,
+                        formula_null = ~ 1,
+                        phi.formula_null = ~ Physiology,
+                        data = ps5NCGlomDNAPI,
+                        test = "Wald", boot = FALSE,
+                        fdr_cutoff = 0.05)
+plot(corncob4, level = "Phylum")
+
+otu_to_taxonomy(OTU = corncob4$significant_taxa, data = ps5Glom)
+corncob4$p
+#HposHneg ns
+
+#What about at hte genus level
+ps5NCGenus <- tax_glom(ps5NC, "Genus")
+corncob5 <- differentialTest(formula = ~ Physiology,
+                        phi.formula = ~ Physiology,
+                        formula_null = ~ 1,
+                        phi.formula_null = ~ Physiology,
+                        data = ps5NCGenus,
+                        test = "Wald", boot = FALSE,
+                        fdr_cutoff = 0.05)
+plot(corncob5, level = "Phylum")
+
+corncob5$significant_taxa
+otu_to_taxonomy(OTU = corncob5$significant_taxa, data = ps5NCGenus)
+corncob5$p_fdr
+
+#Hpos to DNA
+ps5NCGenusDNAHpos <- subset_samples(ps5NCGenus, Physiology%in%c("WC", "BCpos"))
+
+corncob6 <- differentialTest(formula = ~ Physiology,
+                        phi.formula = ~ Physiology,
+                        formula_null = ~ 1,
+                        phi.formula_null = ~ Physiology,
+                        data = ps5NCGenusDNAHpos,
+                        test = "Wald", boot = FALSE,
+                        fdr_cutoff = 0.05)
+plot(corncob6, level = "Phylum")
+
+corncob6$significant_taxa
+otu_to_taxonomy(OTU = corncob6$significant_taxa, data = ps5NCGenus)
+corncob6$p_fdr["af0fff88446abcbcf97eef520cfaf10e"]
+
+#Hpos to Hneg ns
+ps5NCGenusHposHNA <- subset_samples(ps5NCGenus, Physiology%in%c("BCpos", "HNA")) #only pseudomonas is belowe the fdr cutoff
+
+corncob7 <- differentialTest(formula = ~ Physiology,
+                        phi.formula = ~ Physiology,
+                        formula_null = ~ 1,
+                        phi.formula_null = ~ Physiology,
+                        data = ps5NCGenusHposHNA,
+                        test = "Wald", boot = FALSE,
+                        fdr_cutoff = 0.1)
+plot(corncob7, level = "Genus")
+
+corncob7$significant_taxa
+otu_to_taxonomy(OTU = corncob7$significant_taxa, data = ps5NCGenus)
+corncob7$p_fdr["4b7bda76bedf94eacd4747436b65cfd6"]
+
+
+```
+
+
+
+
+#Fig S2 Sorting does not change the whole community controls
+```{r}
+library("rbiom")
+library(gdata)
+library(ggpubr)
+library(rstatix)
+#remove physiology to clean up the data
+S.Controls <- c("WC", "WC-S", "US", "BWC", "BUS", "US-S", "US-PI")
+ps5.SC <- subset_samples(ps5, Physiology %in% S.Controls)
+sample_data(ps5.SC)
+sample_sums(ps5.SC)
+#remove JBWC
+ps5.SC <- subset_samples(ps5.SC, sampleid != "JBWC")
+#rarify for alpha diversity to 10534
+ps5.SC.rar <- rarefy_even_depth(ps5.SC, sample.size = min(sample_sums(ps5.SC)), replace = FALSE, trimOTUs = TRUE)
+#Alpha diveristy
+plot_richness(ps5.SC.rar, measures="Shannon", color = "Individual", x = "Physiology")
+adiv <- estimate_richness(ps5.SC.rar)
+#write.csv(adiv, "adiv.csv")
+#Did the rest in prism because was having troubles modifying the df correctly
+
+#Beta Diversity
+ps5.SC.rar.2 <- subset_samples(ps5.SC.rar, Sorting.Control %in% c("Unsorted", "Sorted") )
+ps5.SC.rar.2  <- subset_samples(ps5.SC.rar.2, Individual != "I")
+BC <- phyloseq::distance(ps5.SC.rar.2, method="bray")
+adonis(BC ~ Sorting.Control,
+       data = as(sample_data(ps5.SC.rar.2), "data.frame"))
+BCSortPCoA = ordinate(ps5.SC.rar.2, method="PCoA", BC)
+s1 <- plot_ordination(ps5.SC.rar.2, BCSortPCoA, "samples", color="Individual", shape = "Sorting.Control", title = "BC PCoA of sorting controls") + 
+  geom_point(size=3) + theme_bw() +   theme(text = element_text(size = 18)) + scale_colour_brewer(palette = "Paired")
+```
+
+
+#Taxa_Summary.R
+```{r}
+#This is shat the taxa_summary.R file is supposed to contain, but it seems like it has an error, and this is supposed to be the one that works. 
+# I am running this before i run summarize_taxa
+
+library("phyloseq")
+library("data.table")
+library("ggplot2")
+
+fast_melt = function(physeq){
+  # supports "naked" otu_table as `physeq` input.
+  otutab = as(otu_table(physeq), "matrix")
+  if(!taxa_are_rows(physeq)){otutab <- t(otutab)}
+  otudt = data.table(otutab, keep.rownames = TRUE)
+  setnames(otudt, "rn", "taxaID")
+  # Enforce character taxaID key
+  otudt[, taxaIDchar := as.character(taxaID)]
+  otudt[, taxaID := NULL]
+  setnames(otudt, "taxaIDchar", "taxaID")
+  # Melt count table
+  mdt = melt.data.table(otudt, 
+                        id.vars = "taxaID",
+                        variable.name = "SampleID",
+                        value.name = "count")
+  # Remove zeroes, NAs
+  mdt <- mdt[count > 0][!is.na(count)]
+  # Calculate relative abundance
+  mdt[, RelativeAbundance := count / sum(count), by = SampleID]
+  if(!is.null(tax_table(physeq, errorIfNULL = FALSE))){
+    # If there is a tax_table, join with it. Otherwise, skip this join.
+    taxdt = data.table(as(tax_table(physeq, errorIfNULL = TRUE), "matrix"), keep.rownames = TRUE)
+    setnames(taxdt, "rn", "taxaID")
+    # Enforce character taxaID key
+    taxdt[, taxaIDchar := as.character(taxaID)]
+    taxdt[, taxaID := NULL]
+    setnames(taxdt, "taxaIDchar", "taxaID")
+    # Join with tax table
+    setkey(taxdt, "taxaID")
+    setkey(mdt, "taxaID")
+    mdt <- taxdt[mdt]
+  }
+  return(mdt)
+}
+
+summarize_taxa = function(physeq, Rank, GroupBy = NULL){
+  Rank <- Rank[1]
+  if(!Rank %in% rank_names(physeq)){
+    message("The argument to `Rank` was:\n", Rank,
+            "\nBut it was not found among taxonomic ranks:\n",
+            paste0(rank_names(physeq), collapse = ", "), "\n",
+            "Please check the list shown above and try again.")
+  }
+  if(!is.null(GroupBy)){
+    GroupBy <- GroupBy[1]
+    if(!GroupBy %in% sample_variables(physeq)){
+      message("The argument to `GroupBy` was:\n", GroupBy,
+              "\nBut it was not found among sample variables:\n",
+              paste0(sample_variables(physeq), collapse = ", "), "\n",
+              "Please check the list shown above and try again.")
+    }
+  }
+  # Start with fast melt
+  mdt = fast_melt(physeq)
+  if(!is.null(GroupBy)){
+    # Add the variable indicated in `GroupBy`, if provided.
+    sdt = data.table(SampleID = sample_names(physeq),
+                     var1 = get_variable(physeq, GroupBy))
+    setnames(sdt, "var1", GroupBy)
+    # Join
+    setkey(sdt, SampleID)
+    setkey(mdt, SampleID)
+    mdt <- sdt[mdt]
+  }
+  # Summarize
+Nsamples = nsamples(physeq)
+  summarydt = mdt[, list(meanRA = sum(RelativeAbundance)/Nsamples,
+                         sdRA = sd(RelativeAbundance),
+                         minRA = min(RelativeAbundance),
+                         maxRA = max(RelativeAbundance)),
+                  by = c(Rank, GroupBy)]
+  return(summarydt)
+}
+
+plot_taxa_summary = function(physeq, Rank, GroupBy = NULL){
+  # Get taxa summary table 
+  dt1 = summarize_taxa(physeq, Rank = Rank, GroupBy = GroupBy)
+  # Set factor appropriately for plotting
+  RankCol = which(colnames(dt1) == Rank)
+  setorder(dt1, -meanRA)
+  dt1[, RankFac := factor(dt1[[Rank]], 
+                          levels = rev(dt1[[Rank]]))]
+  dt1[, ebarMax := max(c(0, min(meanRA + sdRA))), by = eval(Rank)]
+  dt1[, ebarMin := max(c(0, min(meanRA - sdRA))), by = eval(Rank)]
+  # Set zeroes to one-tenth the smallest value
+  ebarMinFloor = dt1[(ebarMin > 0), min(ebarMin)]
+  ebarMinFloor <- ebarMinFloor / 10
+  dt1[(ebarMin == 0), ebarMin := ebarMinFloor]
+
+  pRank = ggplot(dt1, aes(x = meanRA, y = RankFac)) +
+    scale_x_log10() +
+    xlab("Mean Relative Abundance") +
+    ylab(Rank) +
+    theme_bw()
+  if(!is.null(GroupBy)){
+    # pRank <- pRank + facet_wrap(facets = as.formula(paste("~", GroupBy)))
+    pRank <- pRank + geom_point(mapping = aes_string(colour = GroupBy),
+                                size = 5)
+  } else {
+    # Don't include error bars for faceted version
+    pRank <- pRank + geom_errorbarh(aes(xmax = ebarMax,
+                                        xmin = ebarMin))
+  }
+  return(pRank)
+}
+```
+```
+

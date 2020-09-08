@@ -1,0 +1,98 @@
+---
+title: "Healthy Humans"
+author: "Mariia Taguer"
+date: '2019-11-18'
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r}
+df <-read.csv("healthy humans physiology.csv")
+library(dplyr)
+library(nationalparkcolors)
+library(ggplot2)
+library(RColorBrewer)
+pal <- park_palette("Zion")
+```
+
+
+```{r}
+#Dot plot figure
+
+p <- ggplot(df, aes(Physiology, Percent)) #start the plot
+
+getPalette = colorRampPalette(brewer.pal(9, "Spectral"))
+
+palette = c("#1F78B4",  "#FB9A99")
+
+p2 <- p + geom_boxplot() +
+  geom_point(aes(colour=Individual, size = 0.4)) +
+  theme_classic(base_size = 14) +
+  scale_colour_brewer(palette = "Paired") +
+  labs(y = "% Total Cells", colour = "Individual") +
+  ylim(0,100) 
+  
+
+
+#ggsave("Physiology10v2.png")
+```
+
+```{r}
+# Correlation figure 
+
+df2 <-read.csv("healthy humans physiology v2.csv")
+
+colnames(df2) <- c("Individual", "HNA", "BONCAT", "PI")
+df2
+
+library("ggpubr")
+#correlation pearson
+HNAPICorr <- cor.test(df2$HNA, df2$PI, method="pearson") # p-value = 0.01364, r = 0.7438388 
+HNABONCATCorr <- cor.test(df2$HNA, df2$BONCAT, method="pearson") # p-value = 0.05477 ,  r = -0.6221457 
+
+HNABONCAT <- ggplot(df2, aes(HNA, BONCAT)) #start the plot
+b <- HNABONCAT + geom_point(aes(colour=Individual, size = 0.4)) +
+  theme_classic() +
+  scale_colour_brewer(palette = "Paired") +
+  geom_smooth(method="lm", size = 0.5, color = "black") +
+  xlab("% HNA") +
+  ylab("% BONCAT+") +
+  theme(text = element_text(size = 16))
+
+HNAPI <- ggplot(df2, aes(HNA, PI)) #start the plot
+c <- HNAPI + geom_point(aes(colour=Individual, size = 0.4)) +
+  theme_classic() +
+  scale_colour_brewer(palette = "Paired") +
+  geom_smooth(method="lm", size = 0.5, color = "black") +
+  xlab("% HNA") +
+  ylab("% PI+") +
+  theme(text = element_text(size = 16))
+
+```
+
+
+```{r}
+range(df2$HNA)
+mean(df2$HNA)
+median(df2$HNA)
+sd(df2$HNA)
+
+range(df2$BONCAT)
+mean(df2$BONCAT)
+median(df2$BONCAT)
+sd(df2$BONCAT)
+
+range(df2$PI)
+mean(df2$PI)
+median(df2$PI)
+sd(df2$PI)
+```
+
+```{r}
+
+```
+
